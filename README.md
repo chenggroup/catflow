@@ -1,105 +1,148 @@
 # CatFlow
 
-> Parts of the code to be open source.
-
 [![Python package](https://github.com/chenggroup/catflow/actions/workflows/ci.yml/badge.svg)](https://github.com/chenggroup/catflow/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/chenggroup/catflow/graph/badge.svg?token=NGFDZX7WDO)](https://codecov.io/gh/chenggroup/catflow)
+[![DOI](https://img.shields.io/badge/DOI-10.1021/acs.jpcc.4c05568-blue)](https://doi.org/10.1021/acs.jpcc.4c05568)
 
+An automated workflow for training machine learning potentials (MLPs) to compute free energies of catalytic reactions, featuring constrained MD, active learning, and post-analysis toolkit.
 
-Machine learning aided catalysis reaction free energy calculation and post-analysis workflow, thus, analyzer for catalysis.
+> Liu, Y.-P.; Fan, Q.-Y.; Gong, F.-Q.; Cheng, J. *CatFlow: An Automated Workflow for Training Machine Learning Potentials to Compute Free Energies in Dynamic Catalysis.* **J. Phys. Chem. C** 2025, 129, 5, 2536–2552. [DOI: 10.1021/acs.jpcc.4c05568](https://doi.org/10.1021/acs.jpcc.4c05568)
 
-As is known to all, cat is fluid and thus cat flows. 🐱
+## Features
 
-> Former Miko-Analyzer and Miko-Tasker
-> This repository is a temporary branch of original CatFlow.
-> It would be merged into main repo after active refactor.
+- **PMF Workflow**: Automated potential of mean force calculation via constrained MD at multiple temperatures and reaction coordinates, with adaptive melting zone search and convergence testing
+- **TESLA Workflow**: Train-Explore-Screen-Label Active learning scheme for iterative MLP training, with constrained MD along reaction coordinates
+- **oh-my-batch Backend**: Self-contained HPC job submission with built-in recovery (`omb job submit --recovery`) — no external dispatcher needed
+- **Template Engine**: `@VAR@`-based templates for DeePMD/LAMMPS/CP2K input generation, replacing dpgen dependency
+- **Checkpointing**: Function-level `@apply_checkpoint` decorator for resumable workflows
+- **Analyzer**: Free energy surface reconstruction, Lindemann index, coordination analysis, model deviation analysis, and more
 
-## Analyzer
-
-### Installation
-
-To install, clone the repository:
-
-```
-git clone https://github.com/chenggroup/catflow.git
-```
-
-and then install with `pip`:
-
-```
-cd catflow
-pip install .
-```
-
-### Acknowledgement
-This project is inspired by and built upon the following projects:
-- [ai2-kit](https://github.com/chenggroup/ai2-kit): A toolkit featured artificial intelligence × ab initio for computational chemistry research.
-- [DP-GEN](https://github.com/deepmodeling/dpgen): A concurrent learning platform for the generation of reliable deep learning based potential energy models.
-- [ASE](https://wiki.fysik.dtu.dk/ase/): Atomic Simulation Environment.
-- [DPDispatcher](https://github.com/deepmodeling/dpdispatcher): Generate and submit HPC jobs.
-- [Metadynminer](https://github.com/spiwokv/metadynminer): Reading, analysis and visualization of metadynamics HILLS files produced by Plumed. As well as its Python implementation [Metadynminer.py](https://github.com/Jan8be/metadynminer.py).
-- [stringmethod](https://github.com/apallath/stringmethod): Python implementation of the string method to compute the minimum energy path.
-
-## Tasker
-
-### Potential of Mean Force Calculation
-
-A simple workflow designed for free energy calculation from Potential of Mean Force (PMF).
-
-### Usage
-
-#### Commandline
-
-First, prepare a yaml file for workflow settings in detial. For example, `config.yaml`.
-
-
-```yaml
-job_config:
-  work_path: "/some/place"
-  machine_name: "machine_name"
-  resources:
-    number_node: 1
-    cpu_per_node: 1
-    gpu_per_node: 1
-    queue_name: gpu
-    group_size: 1
-    module_list:
-      - ...
-    envs:
-      ...
-  command: "cp2k.ssmp -i input.inp"
-
-  reaction_pair: [0, 1] # select indexes of atoms who would be constrained
-  steps: 10000000 # MD steps
-  timestep: 0.5 # unit: fs
-  restart_steps: 10000000 # extra steps run in each restart
-  dump_freq: 100 # dump frequency
-  cell: [24.0, 24.0, 24.0] # set box size for initial structure
-  type_map: # should be unified with DeePMD potential
-    O: 0
-    Pt: 1
-  model_path: "/place/of/your/graph.pb"
-  backward_files:
-    - ...
-
-flow_config:
-  coordinates: ... # a list of coordinations to be constrained at
-  t_min: 300.0 # under limit of simulation temperature
-  cluster_component:
-    - Pt # select elements of cluster
-  lindemann_n_last_frames: 20000 # use last 20000 steps to judge convergence by calculate Lindemann index
-  init_artifact:
-    - coordinate: 1.4
-      structure_path: "/place/of/your/initial_structure.xyz"
-    - coordinate: 3.8
-      structure_path: "/place/of/your/initial_structure.cif"
-job_type: "dp_pmf" # dp_pmf when using DeePMD
-```
-
-Then, just type command like this:
+## Installation
 
 ```bash
-catflow tasker pmf config.yaml
+git clone https://github.com/chenggroup/catflow.git
+cd catflow
+pip install .
+
+# Optional: install oh-my-batch for the new job submission backend
+pip install oh-my-batch
 ```
 
-And enjoy it!
+## Quick Start
+
+### PMF (Potential of Mean Force) Calculation
+
+Prepare a configuration file:
+
+```yaml
+# config.yaml
+job_config:
+  work_path: "./pmf_work"
+  command: "cp2k.ssmp -i input.inp"
+  machine_name: "local"
+  resources:
+    partition: "gpu"
+    node_count: 1
+    cpu_per_node: 4
+    gpu_per_node: 1
+  reaction_pair: [0, 1]
+  steps: 1000000
+  timestep: 0.5
+
+flow_config:
+  coordinates: [1.4, 1.8, 2.2, 2.6, 3.0, 3.4, 3.8]
+  t_min: 300
+  t_max: 1000
+  melting_test: true
+  is_coordinate: 1.4
+  fs_coordinate: 3.8
+  init_artifact:
+    - coordinate: 1.4
+      structure_path: "./init_IS.xyz"
+    - coordinate: 3.8
+      structure_path: "./init_FS.xyz"
+job_type: "dp_pmf"
+```
+
+Run with checkpointing:
+
+```bash
+catflow tasker pmf config.yaml --checkpoint .ckpt
+```
+
+### TESLA Active Learning
+
+```bash
+# Full omb + template mode (no dpgen needed)
+export CATFLOW_USE_OMB=1
+export CATFLOW_USE_TEMPLATE=1
+catflow tasker tesla param.json machine.json
+```
+
+Or use the bash-driven example:
+
+```bash
+cd example/tesla_omb
+bash 01-workflow/setup.sh
+bash run.sh
+```
+
+## Operation Modes
+
+| `CATFLOW_USE_OMB` | `CATFLOW_USE_TEMPLATE` | Backend |
+|:---:|:---:|---|
+| `0` | `0` | dpgen + dpdispatcher (legacy, backward compatible) |
+| `1` | `0` | dpgen inputs + oh-my-batch submission |
+| `0` | `1` | template inputs + dpgen submission |
+| `1` | `1` | **templates + oh-my-batch (recommended)** |
+
+## Architecture
+
+```
+Python Config → Script Generation → HPC Execution
+(Pydantic)      (omb combo/batch/job)  (WorkflowExecutor)
+```
+
+The workflow generates bash scripts that run directly on HPC login nodes:
+
+```bash
+# Generated by PmfBatchScript / TeslaBatchScript
+omb combo add_var ... make_files ./task.{i}/input.inp --template ... done
+omb batch add_work_dirs ./task.* add_cmd 'cp2k -i input.inp' make ./batch-{i}.slurm
+omb job slurm submit ./batch-*.slurm --max_tries 3 --wait --recovery recovery.json
+```
+
+## Documentation
+
+Full documentation at [wiki.cheng-group.net/catflow](https://wiki.cheng-group.net/catflow)
+
+- [oh-my-batch Workflow](docs/guides/oh-my-batch.md) — architecture, pipeline, checkpointing
+- [Getting Started](docs/guides/get_started_omb.md) — end-to-end examples
+- [Migration Guide](docs/guides/migrate_to_omb.md) — dpdispatcher → oh-my-batch migration
+
+## Citation
+
+```bibtex
+@article{liu2025catflow,
+  title={CatFlow: An Automated Workflow for Training Machine Learning Potentials to Compute Free Energies in Dynamic Catalysis},
+  author={Liu, Yun-Pei and Fan, Qi-Yuan and Gong, Fu-Qiang and Cheng, Jun},
+  journal={J. Phys. Chem. C},
+  volume={129},
+  number={5},
+  pages={2536--2552},
+  year={2025},
+  doi={10.1021/acs.jpcc.4c05568}
+}
+```
+
+## Acknowledgement
+
+This project is inspired by and built upon:
+
+- [ai2-kit](https://github.com/chenggroup/ai2-kit) — AI × ab initio toolkit for computational chemistry
+- [oh-my-batch](https://github.com/link89/oh-my-batch) — HPC batch job management (MT)toolkit
+- [DP-GEN](https://github.com/deepmodeling/dpgen) — Concurrent learning for ML potentials
+- [DeePMD-kit](https://github.com/deepmodeling/deepmd-kit) — Deep learning potential toolkit
+- [ASE](https://wiki.fysik.dtu.dk/ase/) — Atomic Simulation Environment
+- [CP2K](https://www.cp2k.org/) — Atomistic simulations
+- [MDAnalysis](https://www.mdanalysis.org/) — Trajectory analysis
