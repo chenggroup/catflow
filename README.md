@@ -8,6 +8,8 @@ An automated workflow for training machine learning potentials (MLPs) to compute
 
 > Liu, Y.-P.; Fan, Q.-Y.; Gong, F.-Q.; Cheng, J. *CatFlow: An Automated Workflow for Training Machine Learning Potentials to Compute Free Energies in Dynamic Catalysis.* **J. Phys. Chem. C** 2025, 129, 5, 2536–2552. [DOI: 10.1021/acs.jpcc.4c05568](https://doi.org/10.1021/acs.jpcc.4c05568)
 
+As is known to all, cat is fluid and thus cat flows. 🐱
+
 ## Features
 
 - **PMF Workflow**: Automated potential of mean force calculation via constrained MD at multiple temperatures and reaction coordinates, with adaptive melting zone search and convergence testing
