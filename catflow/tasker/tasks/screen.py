@@ -13,7 +13,6 @@ import numba
 from tqdm import tqdm
 
 from catflow.analyzer.tesla import DPTask
-from dpgen.generator.run import make_vasp_incar
 
 
 def structure_collection(path, symbols):
@@ -193,7 +192,26 @@ class SOAPScreening(DPTask):
         # make INCAR
         if incar_path is None:
             incar_path = os.path.join(path, 'INCAR')
-            make_vasp_incar(jdata=self.param_data, filename=incar_path)
+            # Lazy import to avoid hard dpgen dependency
+            try:
+                from dpgen.generator.run import make_vasp_incar
+            except ImportError:
+                # Generate a minimal INCAR if dpgen is not available
+                incar_content = (
+                    f"SYSTEM = FP calculation\n"
+                    f"ENCUT = 600\n"
+                    f"ISIF = 2\n"
+                    f"ISMEAR = 1\n"
+                    f"SIGMA = 0.2\n"
+                    f"EDIFF = 1E-6\n"
+                    f"LORBIT = 11\n"
+                    f"NSW = 0\n"
+                    f"LREAL = Auto\n"
+                )
+                with open(incar_path, 'w') as f:
+                    f.write(incar_content)
+            else:
+                make_vasp_incar(jdata=self.param_data, filename=incar_path)
         else:
             incar_path = os.path.abspath(incar_path)
 

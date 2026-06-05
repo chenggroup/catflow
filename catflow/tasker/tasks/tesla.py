@@ -18,6 +18,23 @@ from catflow.tasker.resources.script_gen import TeslaBatchScript
 from catflow.tasker.resources.workflow_executor import WorkflowExecutor
 from catflow.tasker.resources.template_engine import render_template, find_template
 
+
+def _require_dpgen():
+    """Lazy-load dpgen module with a clear error if not installed.
+
+    Returns the dpgen module if available, or raises ImportError with
+    instructions to use CATFLOW_USE_TEMPLATE=1 / CATFLOW_USE_OMB=1.
+    """
+    try:
+        import dpgen as _dpgen
+        return _dpgen
+    except ImportError:
+        raise ImportError(
+            "dpgen is not installed. Set CATFLOW_USE_TEMPLATE=1 and "
+            "CATFLOW_USE_OMB=1 to use the oh-my-batch + template workflow "
+            "without dpgen. Alternatively, install dpgen: pip install dpgen"
+        )
+
 class TeslaWorkStep(object):
     def __init__(self, params, step_code, machine):
         self.params = params
@@ -69,8 +86,8 @@ class DPTrain(TeslaWorkStep):
     def make(self):
         if self._use_template():
             return self._make_template()
-        from dpgen.generator.run import make_train
-        return make_train(self.step_code, self.params, self.machine)
+        _require_dpgen().generator.run.make_train(
+            self.step_code, self.params, self.machine)
 
     def _make_template(self):
         """Generate DeePMD training input files from templates."""
@@ -154,8 +171,8 @@ class DPTrain(TeslaWorkStep):
         if self._use_omb():
             self._omb_run_train()
         else:
-            from dpgen.generator.run import run_train
-            return run_train(self.step_code, self.params, self.machine)
+            _require_dpgen().generator.run.run_train(
+                self.step_code, self.params, self.machine)
 
     def _use_omb(self) -> bool:
         """Check if oh-my-batch should be used for this step."""
@@ -163,7 +180,6 @@ class DPTrain(TeslaWorkStep):
 
     def _omb_run_train(self):
         """Run DeePMD training via omb combo + batch + job."""
-        import dpgen
         work_dir = Path.cwd()
         iter_dir = work_dir / f"iter.{str(self.step_code).zfill(6)}"
         train_dir = iter_dir / "00.train"
@@ -171,9 +187,13 @@ class DPTrain(TeslaWorkStep):
 
         logger.info(f"[OMB] Preparing training tasks in {train_dir}")
 
-        # Use dpgen's make_train to generate input files first
-        from dpgen.generator.run import make_train
-        make_train(self.step_code, self.params, self.machine)
+        # Generate input files (use template if available, else dpgen)
+        if self._use_template():
+            self._make_template()
+        else:
+            _require_dpgen().generator.run.make_train(
+                self.step_code, self.params, self.machine
+            )
 
         # Generate and submit via omb bash script
         try:
@@ -219,16 +239,16 @@ class DPTrain(TeslaWorkStep):
         if self._use_template():
             from catflow.tasker.collectors.train import collect_train_results
             return collect_train_results(self.step_code)
-        from dpgen.generator.run import post_train
-        return post_train(self.step_code, self.params, self.machine)
+        _require_dpgen().generator.run.post_train(
+            self.step_code, self.params, self.machine)
 
 
 class DPExploration(TeslaWorkStep):
     def make(self):
         if self._use_template():
             return self._make_template()
-        from dpgen.generator.run import make_model_devi
-        return make_model_devi(self.step_code, self.params, self.machine)
+        _require_dpgen().generator.run.make_model_devi(
+            self.step_code, self.params, self.machine)
 
     def _make_template(self):
         """Generate LAMMPS exploration input files from templates."""
@@ -334,8 +354,8 @@ class DPExploration(TeslaWorkStep):
         if self._use_omb():
             self._omb_run_explore()
         else:
-            from dpgen.generator.run import run_model_devi
-            return run_model_devi(self.step_code, self.params, self.machine)
+            _require_dpgen().generator.run.run_model_devi(
+                self.step_code, self.params, self.machine)
 
     def _use_omb(self) -> bool:
         return os.environ.get("CATFLOW_USE_OMB", "0") == "1"
@@ -349,9 +369,13 @@ class DPExploration(TeslaWorkStep):
 
         logger.info(f"[OMB] Preparing exploration tasks in {explore_dir}")
 
-        # Use dpgen's make_model_devi to generate input files first
-        from dpgen.generator.run import make_model_devi
-        make_model_devi(self.step_code, self.params, self.machine)
+        # Generate input files (use template if available, else dpgen)
+        if self._use_template():
+            self._make_template()
+        else:
+            _require_dpgen().generator.run.make_model_devi(
+                self.step_code, self.params, self.machine
+            )
 
         # Extract temperatures from params
         try:
@@ -403,16 +427,16 @@ class DPExploration(TeslaWorkStep):
                 iter_index=self.step_code,
             )
             return results
-        from dpgen.generator.run import post_model_devi
-        return post_model_devi(self.step_code, self.params, self.machine)
+        _require_dpgen().generator.run.post_model_devi(
+            self.step_code, self.params, self.machine)
 
 
 class FPCalculation(TeslaWorkStep):
     def make(self):
         if self._use_template():
             return self._make_template()
-        from dpgen.generator.run import make_fp
-        return make_fp(self.step_code, self.params, self.machine)
+        _require_dpgen().generator.run.make_fp(
+            self.step_code, self.params, self.machine)
 
     def _make_template(self):
         """Generate FP labeling input files from templates."""
@@ -537,8 +561,8 @@ class FPCalculation(TeslaWorkStep):
         if self._use_omb():
             self._omb_run_fp()
         else:
-            from dpgen.generator.run import run_fp
-            return run_fp(self.step_code, self.params, self.machine)
+            _require_dpgen().generator.run.run_fp(
+                self.step_code, self.params, self.machine)
 
     def _use_omb(self) -> bool:
         return os.environ.get("CATFLOW_USE_OMB", "0") == "1"
@@ -552,9 +576,13 @@ class FPCalculation(TeslaWorkStep):
 
         logger.info(f"[OMB] Preparing labeling tasks in {label_dir}")
 
-        # Use dpgen's make_fp to generate input files first
-        from dpgen.generator.run import make_fp
-        make_fp(self.step_code, self.params, self.machine)
+        # Generate input files (use template if available, else dpgen)
+        if self._use_template():
+            self._make_template()
+        else:
+            _require_dpgen().generator.run.make_fp(
+                self.step_code, self.params, self.machine
+            )
 
         # Detect software (CP2K or VASP)
         fp_style = self.params.get("fp_style", "cp2k")
@@ -589,8 +617,8 @@ class FPCalculation(TeslaWorkStep):
         if self._use_template():
             from catflow.tasker.collectors.labeling import collect_labeling_results
             return collect_labeling_results(self.step_code)
-        from dpgen.generator.run import post_fp
-        return post_fp(self.step_code, self.params)
+        _require_dpgen().generator.run.post_fp(
+            self.step_code, self.params)
 
 
 class CLWorkflow(object):
@@ -634,8 +662,26 @@ class CLWorkflow(object):
 
     @property
     def machine(self):
-        from dpgen.remote.decide_machine import convert_mdata
-        return convert_mdata(self.get_data(self.machine_pool))
+        """Load and parse machine configuration.
+
+        Reads the machine pool JSON and returns a standardized dict.
+        Replaces dpgen.remote.decide_machine.convert_mdata.
+        """
+        mdata = self.get_data(self.machine_pool)
+        # If dpgen is not installed, provide a simple identity mapping
+        try:
+            from dpgen.remote.decide_machine import convert_mdata
+            return convert_mdata(mdata)
+        except ImportError:
+            # Fallback: convert to dpgen-compatible format ourselves
+            converted = {}
+            for task_type in ["train", "model_devi", "fp"]:
+                task_key = f"{task_type}_machine"
+                if task_type in mdata:
+                    converted[task_key] = mdata[task_type].get("machine", mdata[task_type])
+                elif "machine" in mdata.get(task_type, {}):
+                    converted[task_key] = mdata[task_type]["machine"]
+            return converted
 
     @property
     def work_path(self):

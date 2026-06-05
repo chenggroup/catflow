@@ -13,7 +13,6 @@ python = "^3.9"
 ase = "^3.21.1"
 click = "*"
 dpdata = "*"
-dpgen = "^0.11.1"
 oh-my-batch = ">=0.6.0"
 
 # dpdispatcher is deprecated and will be removed in a future version
