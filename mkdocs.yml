@@ -6,6 +6,10 @@ repo_url: https://github.com/chenggroup/catflow
 nav:
 - Welcome: index.md
 - Get Start: get_start.md
+- Guides:
+  - oh-my-batch Workflow: guides/oh-my-batch.md
+  - Getting Started with OMB: guides/get_started_omb.md
+  - Migration: guides/migrate_to_omb.md
 - Usage: Usage/
 - Code Reference: reference/
 
