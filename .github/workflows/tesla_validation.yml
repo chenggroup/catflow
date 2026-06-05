@@ -1,0 +1,104 @@
+name: TESLA Validation
+
+on:
+  push:
+    branches:
+      - 'master'
+      - 'devel'
+      - 'refactor/**'
+    paths:
+      - catflow/tasker/**
+      - example/tesla_ch4/**
+      - templates/**
+      - pyproject.toml
+      - .github/workflows/tesla_validation.yml
+  pull_request:
+    paths:
+      - catflow/tasker/**
+      - example/tesla_ch4/**
+      - templates/**
+      - pyproject.toml
+      - .github/workflows/tesla_validation.yml
+  workflow_dispatch:
+
+env:
+  IMAGE: deepmodeling/deepmd-kit:latest
+
+jobs:
+  ch4-validation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull Docker image
+        run: docker pull ${{ env.IMAGE }}
+
+      - name: Verify tools in image
+        run: |
+          docker run --rm ${{ env.IMAGE }} \
+            bash -c "
+              echo '=== Tools ==='
+              dp --version 2>/dev/null || echo 'dp NOT found'
+              lmp -h 2>&1 | head -1 || echo 'lmp NOT found'
+              pip list 2>/dev/null | grep -iE 'deepmd|lammps'
+            "
+
+      - name: Run CH4 validation
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace/example/tesla_ch4 \
+            ${{ env.IMAGE }} \
+            bash -c "
+              set -e
+              pip install oh-my-batch -q 2>/dev/null
+              rm -rf 10-workdir
+              bash run.sh
+            "
+
+      - name: Verify results
+        run: |
+          ITER_DIR=example/tesla_ch4/10-workdir/iter-000
+          echo "=== Verification ==="
+          ERR=0
+
+          check_file() {
+            if [ -f "$1" ]; then echo "  ✓ $2"; else echo "  ✗ $2"; ERR=1; fi
+          }
+
+          echo "--- Training ---"
+          for m in 000 001; do
+            check_file "${ITER_DIR}/00.train/${m}/frozen_model.pb" "frozen_model.pb (model ${m})"
+            check_file "${ITER_DIR}/00.train/${m}/graph.pb"      "graph.pb (model ${m})"
+            check_file "${ITER_DIR}/00.train/${m}/lcurve.out"    "lcurve.out (model ${m})"
+          done
+
+          echo "--- Exploration ---"
+          for t in 300 500; do
+            for r in 0 1; do
+              check_file "${ITER_DIR}/01.model_devi/task.${t}K.${r}/model_devi.out" \
+                "model_devi.out (${t}K rep${r})"
+            done
+          done
+
+          echo "--- Labeling ---"
+          for t in 000 001 002 003; do
+            check_file "${ITER_DIR}/02.fp/task.${t}/output" "CP2K output (task ${t})"
+          done
+
+          echo ""
+          if [ "$ERR" -eq 0 ]; then
+            echo "ALL VALIDATION CHECKS PASSED"
+          else
+            echo "SOME CHECKS FAILED"
+            exit 1
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tesla-ch4-output
+          path: example/tesla_ch4/10-workdir/
+          retention-days: 7
