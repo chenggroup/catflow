@@ -10,6 +10,9 @@ import numpy as np
 
 from catflow.utils.log_factory import logger
 from catflow.tasker.resources.submit import JobFactory
+from catflow.tasker.resources.config import MachineConfig, SbatchResources, JobConfig
+from catflow.tasker.resources.script_gen import ScriptBuilder
+from catflow.tasker.resources.workflow_executor import WorkflowExecutor
 
 
 def trajectory_checkrun_vasp(
@@ -146,115 +149,77 @@ def cell_tests(
     multi_fp_task(work_path=work_path, **task_generation_params)
 
 
-"""
-import json
-import logging
-import time
-import uuid
+def multi_fp_task_omb(
+    work_path,
+    fp_command,
+    machine_name="default",
+    concurrency=4,
+    task_pattern="task.*",
+    forward_files=None,
+    backward_files=None,
+    **kwargs
+):
+    """Submit multiple VASP/CP2K FP tasks via oh-my-batch.
 
-def fp_tasks(ori_fp_tasks, work_path, machine_data, group_size=1):
-    forward_files = ['POSCAR', 'INCAR', 'POTCAR']
-    backward_files = ['OUTCAR', 'vasprun.xml', 'fp.log', 'fp.err', 'tag_0_finished']
-    forward_common_files = []
-    if len(ori_fp_tasks) == 0:
+    Generates an `omb batch` + `omb job` script for the existing
+    task directories under work_path.
+
+    Args:
+        work_path: Directory containing task.* subdirectories.
+        fp_command: Command to run in each task directory.
+        machine_name: Machine name (for logging).
+        concurrency: Number of parallel tasks per batch script.
+        task_pattern: Glob pattern for task directories.
+        forward_files: Files to send to each task directory.
+        backward_files: Files to retrieve from each task directory.
+    """
+    work_path = Path(work_path).resolve()
+    task_dirs = sorted(glob(str(work_path / task_pattern)))
+
+    if not task_dirs:
+        logger.warning(f"No tasks found in {work_path}/{task_pattern}")
         return
-    fp_run_tasks = []
-    for task in ori_fp_tasks:
-        _task_group = glob(task)
-        _task_group.sort()
-        fp_run_tasks += _task_group
-    work_path = os.path.join(work_path, 'groups')
-    if os.path.exists(os.path.join(work_path, 'groups.json')):
-        with open(os.path.join(work_path, 'groups.json'), 'r') as f:
-            _groups = json.load(f)
-    else:
-        _group_num = 0
-        _groups = []
-        _groups_index = 0
-        _uuid = str(uuid.uuid4())
-        _work_dir = os.path.join(work_path, _uuid)
-        os.makedirs(os.path.join(_work_dir), exist_ok=True)
-        for tt in fp_run_tasks:
-            if not os.path.exists(os.path.join(tt, 'tag_0_finished')):
-                if _group_num >= group_size:
-                    _group_num = 0
-                    _groups_index += 1
-                    _uuid = str(uuid.uuid4())
-                    _work_dir = os.path.join(work_path, _uuid)
-                    os.makedirs(os.path.join(_work_dir), exist_ok=True)
-                _base_name = os.path.basename(tt)
-                os.symlink(tt, os.path.join(_work_dir, _base_name))
-                try:
-                    _groups[_groups_index]['run_tasks'].append(_base_name)
-                except IndexError:
-                    _group_item = {
-                        "uuid": _uuid,
-                        "work_dir": _work_dir,
-                        "run_tasks": []
-                    }
-                    _groups.append(_group_item)
-                    _groups[_groups_index]['run_tasks'].append(_base_name)
-                _group_num += 1
-        with open(os.path.join(work_path, 'groups.json'), 'w') as f:
-            json.dump(_groups, f)
-    with daemon.DaemonContext():
-        p = Pool(len(_groups))
-        for i, item in enumerate(_groups):
-            time.sleep(i)
-            p.apply_async(fp_await_submit, args=(
-                item,
-                forward_common_files,
-                forward_files,
-                backward_files,
-                machine_data
-            ))
-        logger.info('Waiting for all tasks done...')
-        p.close()
-        p.join()
-        shutil.rmtree(work_path)
 
+    logger.info(f"[OMB] Found {len(task_dirs)} tasks in {work_path}")
 
-def fp_await_submit(item, forward_common_files=None, forward_files=None, backward_files=None, machine_data=None):
-    print(f'Task {item["uuid"]} was submitted.')
-    os.chdir(item["work_dir"])
-    # machine_data = decide_fp_machine(machine_data)
-    fp_submit(
-        item["work_dir"],
-        item["run_tasks"],
-        forward_common_files,
-        forward_files,
-        backward_files,
-        machine_data
+    # Generate a batch script using omb
+    sb = ScriptBuilder()
+
+    defaults = kwargs.get('resources', {})
+    sb.add_sbatch_header(MachineConfig(
+        name=machine_name,
+        scheduler=kwargs.get('scheduler', 'slurm'),
+        resources=SbatchResources(
+            partition=defaults.get('partition', 'cpu'),
+            node_count=defaults.get('node_count', 1),
+            cpu_per_node=defaults.get('cpu_per_node', 8),
+            gpu_per_node=defaults.get('gpu_per_node', 0),
+        ),
+    ))
+
+    sb.add_comment("FP task submission via oh-my-batch")
+    sb.add_body(f'FP_WORK_DIR="{work_path}"')
+
+    # omb batch: pack tasks
+    batch_cmd = f'omb batch add_work_dirs "{work_path}/{task_pattern}"'
+    if kwargs.get('header_file'):
+        batch_cmd += f' add_header_files "{kwargs["header_file"]}"'
+    batch_cmd += f' add_cmd "{fp_command}"'
+    batch_cmd += f' make "{work_path}/fp-{{i}}.slurm" --concurrency {concurrency}'
+    sb.add_body(batch_cmd)
+
+    # omb job: submit with recovery
+    recovery = kwargs.get('recovery_file', f'{work_path.name}_recovery.json')
+    sb.add_body(
+        f'omb job slurm submit "{work_path}/fp-*.slurm" '
+        f'--max_tries 3 --wait --recovery "{work_path}/{recovery}"'
     )
-    logger.info(f'Task {item["uuid"]} finished.')
 
+    script_path = sb.write(str(work_path / "run_omb_fp.sh"))
+    logger.info(f"[OMB] Script written: {script_path}")
 
-def fp_submit(work_path, run_tasks,
-              forward_common_files=None, forward_files=None, backward_files=None, machine_data=None):
-    fp_command = machine_data['fp_command']
-    fp_group_size = machine_data['fp_group_size']
-    fp_resources = machine_data['fp_resources']
-    mark_failure = fp_resources.get('mark_failure', False)
-    dispatcher = make_dispatcher(
-        machine_data['fp_machine'], machine_data['fp_resources'], work_path, run_tasks, fp_group_size
-    )
-    for i in range(10):
-        try:
-            dispatcher.run_jobs(fp_resources,
-                                [fp_command],
-                                work_path,
-                                run_tasks,
-                                fp_group_size,
-                                forward_common_files,
-                                forward_files,
-                                backward_files,
-                                mark_failure=mark_failure,
-                                outlog='fp.log',
-                                errlog='fp.err')
-        except (Exception, SSHException):
-            if i < 9:
-                time.sleep(0.5)
-            else:
-                time.sleep(0.1)
-                break
-"""
+    executor = WorkflowExecutor.local(work_base=str(work_path))
+    result = executor.run_script(script_path)
+    if result.returncode != 0:
+        raise RuntimeError(f"OMB FP task failed: {result.stderr}")
+    logger.info("[OMB] FP tasks completed successfully.")

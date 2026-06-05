@@ -12,7 +12,10 @@ from pydantic import BaseModel
 from catflow.utils import logger
 from catflow.analyzer.structure.cluster import Cluster
 from catflow.tasker.tasks.pmf import PMFTask, DPPMFTask
+from catflow.tasker.resources.workflow_executor import WorkflowExecutor
+from catflow.tasker.resources.config import MachineConfig, SbatchResources
 from catflow.utils.config import load_yaml_config, get_item_from_list
+from catflow.core import apply_checkpoint, set_checkpoint_dir
 
 
 class JobConfig(BaseModel):
@@ -21,7 +24,7 @@ class JobConfig(BaseModel):
     machine_name: str
     resources: dict
     command: str
-    job_name: Optional[str]
+    job_name: Optional[str] = None
 
 
 class PMFJobConfig(BaseModel):
@@ -32,20 +35,20 @@ class PMFJobConfig(BaseModel):
     command: str
     reaction_pair: List[int]
     job_name: str = "PMF"
-    input_dict: Optional[dict]
-    cell: Optional[List[float]]
-    steps: Optional[int]
-    timestep: Optional[float]
-    dump_freq: Optional[int]
-    restart_steps: Optional[int]
+    input_dict: Optional[dict] = None
+    cell: Optional[List[float]] = None
+    steps: Optional[int] = None
+    timestep: Optional[float] = None
+    dump_freq: Optional[int] = None
+    restart_steps: Optional[int] = None
     outlog: Optional[str] = "output"
     errlog: Optional[str] = "error"
-    forward_common_files: Optional[List[str]]
-    backward_common_files: Optional[List[str]]
-    forward_files: Optional[List[str]]
-    backward_files: Optional[List[str]]
-    model_path: Optional[str]
-    type_map: Optional[dict]
+    forward_common_files: Optional[List[str]] = None
+    backward_common_files: Optional[List[str]] = None
+    forward_files: Optional[List[str]] = None
+    backward_files: Optional[List[str]] = None
+    model_path: Optional[str] = None
+    type_map: Optional[dict] = None
 
 
 class PMFFlowInitArtifact(BaseModel):
@@ -61,9 +64,9 @@ class PMFFlowConfig(BaseModel):
     n_temps: int = 5
     lindemann_n_last_frames: int = 20000
     melting_test: bool = True
-    temperatures: Optional[List[float]]
-    t_min: Optional[float]
-    t_max: Optional[float]
+    temperatures: Optional[List[float]] = None
+    t_min: Optional[float] = None
+    t_max: Optional[float] = None
     init_artifact: Optional[List[PMFFlowInitArtifact]] = None
     is_coordinate: Optional[float] = None
     fs_coordinate: Optional[float] = None
@@ -75,7 +78,7 @@ class PMFInput(BaseModel):
     """Potential of mean force calculation configuration."""
     job_config: PMFJobConfig
     flow_config: PMFFlowConfig
-    dump_dict: Optional[dict]
+    dump_dict: Optional[dict] = None
     job_type: Literal["pmf", "dp_pmf"] = "pmf"
 
 
@@ -165,9 +168,22 @@ async def dump_pmf_output(
 
 async def flow_pmf_calculation(
     flow_input: PMFInput,
-    flow_output: Optional[PMFOutput] = None
+    flow_output: Optional[PMFOutput] = None,
+    checkpoint_dir: Optional[str] = None,
 ) -> PMFOutput:
-    """Calculate the PMF of a given COLVAR."""
+    """Calculate the PMF of a given COLVAR.
+
+    Args:
+        flow_input: PMF calculation configuration.
+        flow_output: Optional existing output state for resuming.
+        checkpoint_dir: Directory for ai2-kit checkpoint storage.
+            Enables resumable workflow across interruptions.
+    """
+
+    # Enable checkpointing for resumable workflow
+    if checkpoint_dir is not None:
+        set_checkpoint_dir(checkpoint_dir)
+        logger.info(f"Checkpoint enabled at: {checkpoint_dir}")
 
     # define list to store the tasks
     pmf_task_outputs = SafeList()
@@ -214,6 +230,7 @@ async def flow_pmf_calculation(
     return flow_output
 
 
+@apply_checkpoint(lambda coordinate, temperature, **kw: f"pmf_task_{coordinate}_{temperature}")
 async def task_pmf_calculation(
     coordinate: float,
     temperature: float,
@@ -222,7 +239,11 @@ async def task_pmf_calculation(
     init_structure_path: Optional[str] = None,
     restart_time: int = 0
 ) -> PMFTaskOutput:
-    """Run potential of mean force calculation."""
+    """Run potential of mean force calculation.
+
+    Checkpointed by (coordinate, temperature) pair so completed tasks
+    are skipped on resume.
+    """
     logger.info(f"Running PMF calculation at {temperature} K.")
     logger.info(f"Coordinate: {coordinate}")
 
@@ -276,14 +297,19 @@ async def task_pmf_calculation(
     if task_finished_tag.exists():
         logger.info(f"Task {task_run.task_path} finished, skipped.")
     else:
-        with ProcessPoolExecutor() as executor:
-            task_instance = task_run.generate_submission()
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                executor, task_instance.run_submission
+        # New path: generate oh-my-batch script and execute via WorkflowExecutor
+        script_path = task_run.generate_script()
+        executor = WorkflowExecutor.local(work_base=str(task_run.work_path))
+        result = await asyncio.to_thread(
+            executor.run_script, script_path, str(task_run.work_path)
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"PMF task failed at {task_run.task_path}. "
+                f"STDOUT: {result.stdout}\nSTDERR: {result.stderr}"
             )
-            logger.info(f"Task {task_run.task_path} finished.")
-            task_finished_tag.touch()
+        logger.info(f"Task {task_run.task_path} finished.")
+        task_finished_tag.touch()
 
     # last frame_path
     last_frame_path = str(task_run.get_last_frame())

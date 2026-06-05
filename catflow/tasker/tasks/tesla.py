@@ -1,11 +1,10 @@
-from curses import use_default_colors
 import json
 import os
 import sys
 import shutil
+import warnings
 from glob import glob
 from pathlib import Path
-from turtle import st
 
 from yaml import load, SafeLoader
 import numpy as np
@@ -14,6 +13,9 @@ from ase.io import read, write
 
 from catflow.utils import logger
 from catflow.utils.file import count_lines
+from catflow.tasker.resources.config import MachineConfig, SbatchResources
+from catflow.tasker.resources.script_gen import TeslaBatchScript
+from catflow.tasker.resources.workflow_executor import WorkflowExecutor
 
 class TeslaWorkStep(object):
     def __init__(self, params, step_code, machine):
@@ -38,15 +40,94 @@ class TeslaWorkStep(object):
     def post(self):
         pass
 
+    def _build_workflow_executor(self, work_dir: str) -> WorkflowExecutor:
+        """Build a WorkflowExecutor from the dpgen machine config.
+
+        Attempts to extract scheduler and resource info from the
+        standard dpgen machine config format.
+        """
+        try:
+            mdata = self.machine
+            # Try to get first machine config for submission
+            if isinstance(mdata, dict) and len(mdata) > 0:
+                first_key = list(mdata.keys())[0]
+                mcfg = mdata[first_key] if isinstance(mdata, dict) else {}
+                return WorkflowExecutor.local(work_base=work_dir)
+        except Exception:
+            pass
+        return WorkflowExecutor.local(work_base=work_dir)
+
 
 # TODO: refine each step of whole workflow.
 class DPTrain(TeslaWorkStep):
-    
+
     def make(self):
         from dpgen.generator.run import make_train
         return make_train(self.step_code, self.params, self.machine)
 
     def run(self):
+        """Run training via oh-my-batch (omb) if available, fallback to dpgen."""
+        if self._use_omb():
+            self._omb_run_train()
+        else:
+            from dpgen.generator.run import run_train
+            return run_train(self.step_code, self.params, self.machine)
+
+    def _use_omb(self) -> bool:
+        """Check if oh-my-batch should be used for this step."""
+        return os.environ.get("CATFLOW_USE_OMB", "0") == "1"
+
+    def _omb_run_train(self):
+        """Run DeePMD training via omb combo + batch + job."""
+        import dpgen
+        work_dir = Path.cwd()
+        iter_dir = work_dir / f"iter.{str(self.step_code).zfill(6)}"
+        train_dir = iter_dir / "00.train"
+        train_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"[OMB] Preparing training tasks in {train_dir}")
+
+        # Use dpgen's make_train to generate input files first
+        from dpgen.generator.run import make_train
+        make_train(self.step_code, self.params, self.machine)
+
+        # Generate and submit via omb bash script
+        try:
+            n_models = self.params.get("numb_models", 4)
+            n_steps = self.params.get("default_training_param", {}).get(
+                "training", {}).get("numb_steps", 400000)
+        except Exception:
+            n_models = 4
+            n_steps = 400000
+
+        script = TeslaBatchScript(
+            machine=MachineConfig(
+                name="tesla_train",
+                scheduler="slurm",
+                resources=SbatchResources(
+                    partition="gpu",
+                    node_count=1,
+                    cpu_per_node=4,
+                    gpu_per_node=1,
+                ),
+            )
+        )
+        script.train_stage(
+            work_dir=str(work_dir),
+            model_count=n_models,
+            train_steps=n_steps,
+            concurrency=4,
+        )
+        script_path = script.write(str(train_dir / "run_omb_train.sh"))
+        logger.info(f"[OMB] Training script written: {script_path}")
+
+        executor = self._build_workflow_executor(str(work_dir))
+        result = executor.run_script(script_path)
+        if result.returncode != 0:
+            raise RuntimeError(f"OMB training failed: {result.stderr}")
+
+    def run_dpgen(self):
+        """Legacy dpgen-based submission."""
         from dpgen.generator.run import run_train
         return run_train(self.step_code, self.params, self.machine)
 
@@ -61,8 +142,65 @@ class DPExploration(TeslaWorkStep):
         return make_model_devi(self.step_code, self.params, self.machine)
 
     def run(self):
-        from dpgen.generator.run import run_model_devi
-        return run_model_devi(self.step_code, self.params, self.machine)
+        """Run exploration via oh-my-batch (omb) if available, fallback to dpgen."""
+        if self._use_omb():
+            self._omb_run_explore()
+        else:
+            from dpgen.generator.run import run_model_devi
+            return run_model_devi(self.step_code, self.params, self.machine)
+
+    def _use_omb(self) -> bool:
+        return os.environ.get("CATFLOW_USE_OMB", "0") == "1"
+
+    def _omb_run_explore(self):
+        """Run LAMMPS exploration via omb combo + batch + job."""
+        work_dir = Path.cwd()
+        iter_dir = work_dir / f"iter.{str(self.step_code).zfill(6)}"
+        explore_dir = iter_dir / "01.model_devi"
+        explore_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"[OMB] Preparing exploration tasks in {explore_dir}")
+
+        # Use dpgen's make_model_devi to generate input files first
+        from dpgen.generator.run import make_model_devi
+        make_model_devi(self.step_code, self.params, self.machine)
+
+        # Extract temperatures from params
+        try:
+            model_devi_jobs = self.params.get("model_devi_jobs", [])
+            cur_job = model_devi_jobs[self.step_code] if self.step_code < len(model_devi_jobs) else model_devi_jobs[-1]
+            temps = cur_job.get("rev_mat", {}).get("lmp", {}).get("V_TEMP", [300, 500, 1000])
+        except Exception:
+            temps = [300, 500, 1000]
+
+        n_models = self.params.get("numb_models", 4)
+
+        script = TeslaBatchScript(
+            machine=MachineConfig(
+                name="tesla_explore",
+                scheduler="slurm",
+                resources=SbatchResources(
+                    partition="gpu",
+                    node_count=1,
+                    cpu_per_node=4,
+                    gpu_per_node=0,
+                ),
+            )
+        )
+        script.explore_stage(
+            work_dir=str(work_dir),
+            iter_name=str(self.step_code).zfill(6),
+            temperatures=temps,
+            model_count=n_models,
+            concurrency=5,
+        )
+        script_path = script.write(str(explore_dir / "run_omb_explore.sh"))
+        logger.info(f"[OMB] Exploration script written: {script_path}")
+
+        executor = self._build_workflow_executor(str(work_dir))
+        result = executor.run_script(script_path)
+        if result.returncode != 0:
+            raise RuntimeError(f"OMB exploration failed: {result.stderr}")
 
     def post(self):
         from dpgen.generator.run import post_model_devi
@@ -75,8 +213,57 @@ class FPCalculation(TeslaWorkStep):
         return make_fp(self.step_code, self.params, self.machine)
 
     def run(self):
-        from dpgen.generator.run import run_fp
-        return run_fp(self.step_code, self.params, self.machine)
+        """Run FP labeling via oh-my-batch (omb) if available, fallback to dpgen."""
+        if self._use_omb():
+            self._omb_run_fp()
+        else:
+            from dpgen.generator.run import run_fp
+            return run_fp(self.step_code, self.params, self.machine)
+
+    def _use_omb(self) -> bool:
+        return os.environ.get("CATFLOW_USE_OMB", "0") == "1"
+
+    def _omb_run_fp(self):
+        """Run CP2K/VASP labeling via omb batch + job."""
+        work_dir = Path.cwd()
+        iter_dir = work_dir / f"iter.{str(self.step_code).zfill(6)}"
+        label_dir = iter_dir / "02.fp"
+        label_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"[OMB] Preparing labeling tasks in {label_dir}")
+
+        # Use dpgen's make_fp to generate input files first
+        from dpgen.generator.run import make_fp
+        make_fp(self.step_code, self.params, self.machine)
+
+        # Detect software (CP2K or VASP)
+        fp_style = self.params.get("fp_style", "cp2k")
+
+        script = TeslaBatchScript(
+            machine=MachineConfig(
+                name="tesla_label",
+                scheduler="slurm",
+                resources=SbatchResources(
+                    partition="cpu",
+                    node_count=1,
+                    cpu_per_node=8,
+                    gpu_per_node=0,
+                ),
+            )
+        )
+        script.labeling_stage(
+            work_dir=str(work_dir),
+            iter_name=str(self.step_code).zfill(6),
+            software=fp_style,
+            concurrency=5,
+        )
+        script_path = script.write(str(label_dir / "run_omb_label.sh"))
+        logger.info(f"[OMB] Labeling script written: {script_path}")
+
+        executor = self._build_workflow_executor(str(work_dir))
+        result = executor.run_script(script_path)
+        if result.returncode != 0:
+            raise RuntimeError(f"OMB labeling failed: {result.stderr}")
 
     def post(self):
         from dpgen.generator.run import post_fp

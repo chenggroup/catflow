@@ -1,5 +1,6 @@
 import json
 import os
+import warnings
 import numpy as np
 
 from collections import deque, defaultdict
@@ -15,6 +16,9 @@ from pydantic import BaseModel
 
 from catflow.utils import logger
 from catflow.tasker.resources.submit import JobFactory
+from catflow.tasker.resources.config import MachineConfig, SbatchResources, JobConfig
+from catflow.tasker.resources.script_gen import PmfBatchScript
+from catflow.tasker.resources.workflow_executor import WorkflowExecutor
 from catflow.utils.file import tail
 from catflow.utils.cp2k import Cp2kInput, Cp2kInputToDict
 
@@ -268,7 +272,65 @@ class PMFTask(object):
                          self.machine_name, self.resource_dict)
         return job.submission
 
+    def generate_script(self, script_path: Optional[str] = None,
+                        concurrency: int = 1) -> str:
+        """Generate a bash script using oh-my-batch for PMF calculation.
+
+        Replaces `generate_submission()` for the new oh-my-batch backend.
+        Produces a script that calls `omb combo` + `omb batch` + `omb job`.
+
+        Args:
+            script_path: Path to write the script. Auto-generated if None.
+            concurrency: Number of parallel tasks per batch group.
+
+        Returns:
+            Path to the generated bash script.
+        """
+        if self.restart_time > 0:
+            self._task_restart()
+        else:
+            self._task_preprocess()
+            self._task_generate()
+        self._task_postprocess()
+
+        # Build machine config from the existing kwargs/resources
+        machine = MachineConfig(
+            name=self.machine_name,
+            scheduler="slurm",
+            resources=SbatchResources(
+                partition=self.resource_dict.get("partition", "cpu"),
+                node_count=self.resource_dict.get("node_count", 1),
+                cpu_per_node=self.resource_dict.get("cpu_per_node", 1),
+                gpu_per_node=self.resource_dict.get("gpu_per_node", 0),
+            ),
+        )
+
+        script = PmfBatchScript(
+            machine=machine,
+            command=self.command,
+            forward_files=self.kwargs.get("forward_files", []),
+            backward_files=self.kwargs.get("backward_files", []),
+        )
+
+        if script_path is None:
+            script_path = str(self.task_path / "run_pmf.sh")
+
+        script.build_pmf_script(
+            coordinates=[self.coordinate],
+            temperatures=[self.temperature],
+            template_dir=str(self.task_path),
+            output_dir=str(self.task_path),
+            concurrency=concurrency,
+        )
+        return script.write(script_path)
+
     def check_point(self):
+        """Checkpoint the current state of the task.
+
+        Uses ai2-kit's @apply_checkpoint mechanism for resumability.
+        """
+        from catflow.core import set_checkpoint_dir
+        set_checkpoint_dir(str(self.work_path / ".ckpt"))
         pass
 
     def input_dict_from_file(self, template_file):

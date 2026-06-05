@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 from glob import glob
+from pathlib import Path
 
 import dpdata
 import numpy as np
@@ -10,6 +11,9 @@ from ase.io import read, write
 from catflow.utils.log_factory import logger
 from catflow.analyzer.tesla.dpgen.task import DPTask
 from catflow.tasker.resources.submit import JobFactory
+from catflow.tasker.resources.config import MachineConfig, SbatchResources
+from catflow.tasker.resources.script_gen import ScriptBuilder
+from catflow.tasker.resources.workflow_executor import WorkflowExecutor
 from catflow.utils.lammps import \
     convert_init_structures, check_keywords, \
     parse_template, substitute_keywords
@@ -88,6 +92,74 @@ class DPCheck:
         }
         job = JobFactory(task_dict_list, submission_dict, machine_name, resource_dict)
         return job.submission
+
+    def md_single_task_omb(
+            self,
+            work_path,
+            model_path,
+            concurrency=4,
+            lmp_command="lmp -i input.lammps",
+            **kwargs
+    ):
+        """Submit LAMMPS MD tasks via oh-my-batch.
+
+        Args:
+            work_path: Directory containing task.* subdirectories.
+            model_path: Path to DeepMD model files (graph.*.pb).
+            concurrency: Number of parallel tasks per batch script.
+            lmp_command: LAMMPS execution command.
+            kwargs: Additional options (forward_files, backward_files, etc.)
+        """
+        from glob import glob
+        work_path = Path(work_path).resolve()
+        model_path = Path(model_path).resolve()
+
+        # Symlink models
+        model_files = sorted(glob(str(model_path / "graph*.pb")))
+        for mf in model_files:
+            target = work_path / Path(mf).name
+            if not target.exists():
+                target.symlink_to(mf)
+
+        task_dirs = sorted(glob(str(work_path / "task.*")))
+        if not task_dirs:
+            logger.warning(f"No tasks found in {work_path}/task.*")
+            return
+
+        logger.info(f"[OMB] Found {len(task_dirs)} tasks for MD test")
+
+        sb = ScriptBuilder()
+        sb.add_sbatch_header(MachineConfig(
+            name="dpcheck",
+            scheduler=kwargs.get('scheduler', 'slurm'),
+            resources=SbatchResources(
+                partition=kwargs.get('partition', 'gpu'),
+                node_count=1,
+                cpu_per_node=kwargs.get('cpu_per_node', 4),
+                gpu_per_node=kwargs.get('gpu_per_node', 1),
+            ),
+        ))
+
+        sb.add_comment("MD test via oh-my-batch")
+        batch_cmd = (
+            f'omb batch add_work_dirs "{work_path}/task.*"'
+            f' add_cmd "{lmp_command}"'
+            f' make "{work_path}/md-{{i}}.slurm" --concurrency {concurrency}'
+        )
+        sb.add_body(batch_cmd)
+
+        recovery = kwargs.get('recovery_file', 'md_test_recovery.json')
+        sb.add_body(
+            f'omb job slurm submit "{work_path}/md-*.slurm"'
+            f' --max_tries 2 --wait --recovery "{work_path}/{recovery}"'
+        )
+
+        script_path = sb.write(str(work_path / "run_omb_md.sh"))
+        executor = WorkflowExecutor.local(work_base=str(work_path))
+        result = executor.run_script(script_path)
+        if result.returncode != 0:
+            raise RuntimeError(f"OMB MD test failed: {result.stderr}")
+        logger.info("[OMB] MD test completed.")
 
     def train_model_test(
             self,
