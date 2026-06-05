@@ -133,7 +133,7 @@ def count_fp_candidates(iter_index: int, base_dir: str = ".") -> Dict[int, int]:
     for cand_file in sorted(glob(str(fp_dir / "candidate.shuffled.*.out"))):
         parts = Path(cand_file).stem.split(".")
         if len(parts) >= 3:
-            sys_idx = int(parts[-2])
+            sys_idx = int(parts[-1])
             with open(cand_file) as f:
                 counts[sys_idx] = sum(1 for line in f if line.strip())
 

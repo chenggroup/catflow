@@ -39,9 +39,11 @@ jobs:
           docker run --rm ${{ env.IMAGE }} \
             bash -c "
               echo '=== Tools ==='
-              dp --version 2>/dev/null || echo 'dp NOT found'
-              lmp -h 2>&1 | head -1 || echo 'lmp NOT found'
-              pip list 2>/dev/null | grep -iE 'deepmd|lammps'
+              echo -n 'dp: '; dp --version 2>/dev/null || echo 'NOT FOUND'
+              echo -n 'lmp: '; lmp -h 2>&1 | head -1 || echo 'NOT FOUND'
+              python3 --version
+              echo '=== Python packages ==='
+              pip list 2>/dev/null | grep -iE 'ase|deepmd|lammps|numpy|pytest'
             "
 
       - name: Run CH4 validation
@@ -52,7 +54,9 @@ jobs:
             ${{ env.IMAGE }} \
             bash -c "
               set -e
-              pip install oh-my-batch -q 2>/dev/null
+              echo '=== Install Python dependencies ==='
+              pip install oh-my-batch ase -q 2>/dev/null
+              echo '=== Run validation ==='
               rm -rf 10-workdir
               bash run.sh
             "
@@ -94,6 +98,21 @@ jobs:
             echo "SOME CHECKS FAILED"
             exit 1
           fi
+
+      - name: Run catflow unit tests (inside container)
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            ${{ env.IMAGE }} \
+            bash -c "
+              set -e
+              echo '=== Install catflow dependencies ==='
+              pip install oh-my-batch ase pymatgen pytest -q 2>/dev/null
+              pip install -e . -q 2>/dev/null
+              echo '=== Run core tests ==='
+              python -m pytest tests/tasker/resources/ tests/test_core.py -v --tb=short --no-header
+            "
 
       - name: Upload artifacts
         if: always()
