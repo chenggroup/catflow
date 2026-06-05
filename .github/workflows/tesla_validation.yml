@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
 
 env:
-  IMAGE: deepmodeling/deepmd-kit:latest
+  IMAGE: deepmodeling/deepmd-kit:3.1.3_cpu
 
 jobs:
   ch4-validation:

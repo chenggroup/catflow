@@ -4,8 +4,8 @@ set -e
 # Run CH4 validation case inside deepmodeling/deepmd-kit Docker container
 # This provides real dp (DeePMD train) and lmp (LAMMPS) commands
 
-REGISTRY="${REGISTRY:-registry.linkease.net:5443/library}"
-IMAGE="${REGISTRY}/deepmodeling/deepmd-kit:latest"
+REGISTRY="${REGISTRY:-docker.io}"
+IMAGE="${REGISTRY}/deepmodeling/deepmd-kit:3.1.3_cpu"
 WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "Pulling image: ${IMAGE}"
