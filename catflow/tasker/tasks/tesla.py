@@ -16,6 +16,7 @@ from catflow.utils.file import count_lines
 from catflow.tasker.resources.config import MachineConfig, SbatchResources
 from catflow.tasker.resources.script_gen import TeslaBatchScript
 from catflow.tasker.resources.workflow_executor import WorkflowExecutor
+from catflow.tasker.resources.template_engine import render_template, find_template
 
 class TeslaWorkStep(object):
     def __init__(self, params, step_code, machine):
@@ -40,6 +41,10 @@ class TeslaWorkStep(object):
     def post(self):
         pass
 
+    def _use_template(self) -> bool:
+        """Check if template-based input generation should be used."""
+        return os.environ.get("CATFLOW_USE_TEMPLATE", "0") == "1"
+
     def _build_workflow_executor(self, work_dir: str) -> WorkflowExecutor:
         """Build a WorkflowExecutor from the dpgen machine config.
 
@@ -62,8 +67,87 @@ class TeslaWorkStep(object):
 class DPTrain(TeslaWorkStep):
 
     def make(self):
+        if self._use_template():
+            return self._make_template()
         from dpgen.generator.run import make_train
         return make_train(self.step_code, self.params, self.machine)
+
+    def _make_template(self):
+        """Generate DeePMD training input files from templates."""
+        import dpdata
+        from ase.io import read as ase_read
+
+        iter_idx = self.step_code
+        iter_dir = Path(f"iter.{str(iter_idx).zfill(6)}")
+        train_dir = iter_dir / "00.train"
+        train_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"[TMPL] Generating training tasks in {train_dir}")
+
+        # --- data setup ---
+        init_data_path = Path(self.params.get("init_data_prefix", "."))
+        init_data_name = self.params.get("init_data", "")
+        train_dir_symlink = train_dir / "data.init"
+        if not train_dir_symlink.exists():
+            target = (init_data_path / init_data_name).resolve()
+            train_dir_symlink.symlink_to(target, target_is_directory=True)
+
+        # --- type_map & sel ---
+        type_map = self.params.get("type_map", [])
+        type_map_str = ", ".join(f'"{t}"' for t in type_map)
+
+        # Calculate sel from type_map based on rcut
+        try:
+            from dpdata.system import get_frame
+            sys_data = dpdata.LabeledSystem(str(train_dir_symlink), fmt="deepmd/npy")
+            type_count = dict(zip(type_map, [0]*len(type_map)))
+            for atom_type in sys_data['atom_types']:
+                type_count[type_map[atom_type]] = type_count.get(type_map[atom_type], 0) + 1
+            sel = [max(1, int(c * 1.2)) for c in type_count.values()]
+            sel_str = ", ".join(str(s) for s in sel)
+        except Exception:
+            sel_str = "46"
+
+        # --- dataset paths ---
+        dataset_paths = [f'"{train_dir}/data.init"']
+        for i in range(iter_idx):
+            prev_data = Path(f"iter.{str(i).zfill(6)}") / "02.fp" / "data"
+            if prev_data.exists():
+                dataset_paths.append(f'"{prev_data}"')
+        dataset_str = ", ".join(dataset_paths)
+
+        # --- model count & seeds ---
+        numb_models = self.params.get("numb_models", 4)
+        seeds = list(np.random.randint(0, 1000000, size=numb_models))
+
+        # --- training steps ---
+        default_param = self.params.get("default_training_param", {})
+        n_steps = default_param.get("training", {}).get("numb_steps", 400000)
+        decay_steps = default_param.get("learning_rate", {}).get("decay_steps", 5000)
+
+        # --- generate per-model input.json ---
+        tpl_path = find_template("deepmd/input.json")
+        if tpl_path is None:
+            raise FileNotFoundError(
+                "Template not found: templates/deepmd/input.json.template. "
+                "Set CATFLOW_USE_TEMPLATE=0 to use dpgen, or provide the template file."
+            )
+
+        for model_idx in range(numb_models):
+            model_dir = train_dir / f"{str(model_idx).zfill(3)}"
+            model_dir.mkdir(parents=True, exist_ok=True)
+
+            render_template(tpl_path, {
+                "TYPE_MAP": type_map_str,
+                "SEL": sel_str,
+                "SEED": str(seeds[model_idx]),
+                "STEPS": str(n_steps),
+                "DECAY_STEPS": str(decay_steps),
+                "DP_DATASET": dataset_str,
+            }, str(model_dir / "input.json"))
+
+        logger.info(f"[TMPL] Generated {numb_models} training tasks in {train_dir}")
+        return 0
 
     def run(self):
         """Run training via oh-my-batch (omb) if available, fallback to dpgen."""
@@ -132,14 +216,118 @@ class DPTrain(TeslaWorkStep):
         return run_train(self.step_code, self.params, self.machine)
 
     def post(self):
+        if self._use_template():
+            from catflow.tasker.collectors.train import collect_train_results
+            return collect_train_results(self.step_code)
         from dpgen.generator.run import post_train
         return post_train(self.step_code, self.params, self.machine)
 
 
 class DPExploration(TeslaWorkStep):
     def make(self):
+        if self._use_template():
+            return self._make_template()
         from dpgen.generator.run import make_model_devi
         return make_model_devi(self.step_code, self.params, self.machine)
+
+    def _make_template(self):
+        """Generate LAMMPS exploration input files from templates."""
+        import dpdata
+
+        iter_idx = self.step_code
+        iter_dir = Path(f"iter.{str(iter_idx).zfill(6)}")
+        exp_dir = iter_dir / "01.model_devi"
+        exp_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"[TMPL] Generating exploration tasks in {exp_dir}")
+
+        # --- symlink model graphs from training ---
+        train_dir = iter_dir / "00.train"
+        model_files = sorted(glob(str(train_dir / "*/frozen_model.pb")))
+        if not model_files:
+            model_files = sorted(glob(str(train_dir / "*/graph.pb")))
+        for i, mf in enumerate(model_files):
+            target = exp_dir / f"graph.{str(i).zfill(3)}.pb"
+            if not target.exists():
+                target.symlink_to(Path(mf).resolve())
+
+        # --- mass_map from params ---
+        mass_map = self.params.get("mass_map", [])
+        mass_map_str = " ".join(str(m) for m in mass_map)
+
+        # --- conf setup (from init structures) ---
+        sys_configs = self.params.get("sys_configs", [])
+        sys_prefix = self.params.get("sys_configs_prefix", ".")
+        conf_dir = exp_dir / "confs"
+        conf_dir.mkdir(exist_ok=True)
+
+        for sys_idx, cfgs in enumerate(sys_configs):
+            for conf_idx, cfg_path in enumerate(cfgs):
+                full_path = Path(sys_prefix) / cfg_path
+                if full_path.exists():
+                    poscar_link = conf_dir / f"{sys_idx}.{conf_idx}.poscar"
+                    if not poscar_link.exists():
+                        poscar_link.symlink_to(full_path.resolve())
+                    # Convert to LAMMPS data
+                    lmp_path = conf_dir / f"{sys_idx}.{conf_idx}.lmp"
+                    if not lmp_path.exists():
+                        try:
+                            sys_data = dpdata.System(str(full_path), fmt="vasp/poscar")
+                            sys_data.to_lammps_lmp(str(lmp_path))
+                        except Exception:
+                            pass
+
+        # --- job config from params ---
+        model_devi_jobs = self.params.get("model_devi_jobs", [])
+        cur_job = model_devi_jobs[iter_idx] if iter_idx < len(model_devi_jobs) else {}
+        rev_mat = cur_job.get("rev_mat", {})
+        lmp_conf = rev_mat.get("lmp", {})
+        temps = lmp_conf.get("V_TEMP", [300])
+        pres = lmp_conf.get("V_PRES", [1])
+        nsteps = lmp_conf.get("V_NSTEPS", [10000])
+        dt = lmp_conf.get("V_DT", [0.002])
+
+        model_list = " ".join(
+            f"../graph.{str(i).zfill(3)}.pb" for i in range(len(model_files))
+        )
+        sys_idx_list = cur_job.get("sys_idx", list(range(len(sys_configs))))
+
+        # --- generate LAMMPS input template ---
+        tpl_path = find_template("lammps/explore.in")
+        if tpl_path is None:
+            raise FileNotFoundError("Template not found: templates/lammps/explore.in.template")
+
+        task_idx = 0
+        for sidx in sys_idx_list:
+            for temp in temps:
+                task_dir = exp_dir / f"task.{sidx}.{task_idx}"
+                task_dir.mkdir(parents=True, exist_ok=True)
+
+                # Link conf
+                conf_link = task_dir / "conf.lmp"
+                conf_src = conf_dir / f"{sidx}.0.lmp"
+                if conf_src.exists() and not conf_link.exists():
+                    conf_link.symlink_to(conf_src)
+
+                seed = np.random.randint(100000, 999999)
+
+                render_template(tpl_path, {
+                    "NSTEPS": str(nsteps[0] if isinstance(nsteps, list) else nsteps),
+                    "TEMP": str(temp),
+                    "SEED": str(seed),
+                    "DP_MODELS": model_list,
+                    "MASS_MAP": mass_map_str,
+                    "DT": str(dt[0] if isinstance(dt, list) else dt),
+                }, str(task_dir / "input.lammps"))
+
+                # Write job.json
+                with open(task_dir / "job.json", "w") as f:
+                    json.dump({"sys_idx": sidx, "temp": temp, "pres": pres}, f)
+
+                task_idx += 1
+
+        logger.info(f"[TMPL] Generated {task_idx} exploration tasks in {exp_dir}")
+        return 0
 
     def run(self):
         """Run exploration via oh-my-batch (omb) if available, fallback to dpgen."""
@@ -203,14 +391,146 @@ class DPExploration(TeslaWorkStep):
             raise RuntimeError(f"OMB exploration failed: {result.stderr}")
 
     def post(self):
+        if self._use_template():
+            from catflow.tasker.collectors.exploration import (
+                collect_exploration_results, generate_shuffled_stats
+            )
+            results = collect_exploration_results(self.step_code)
+            generate_shuffled_stats(
+                results,
+                f_trust_lo=self.params.get("model_devi_f_trust_lo", 0.1),
+                f_trust_hi=self.params.get("model_devi_f_trust_hi", 0.3),
+                iter_index=self.step_code,
+            )
+            return results
         from dpgen.generator.run import post_model_devi
         return post_model_devi(self.step_code, self.params, self.machine)
 
 
 class FPCalculation(TeslaWorkStep):
     def make(self):
+        if self._use_template():
+            return self._make_template()
         from dpgen.generator.run import make_fp
         return make_fp(self.step_code, self.params, self.machine)
+
+    def _make_template(self):
+        """Generate FP labeling input files from templates."""
+        import dpdata
+
+        iter_idx = self.step_code
+        iter_dir = Path(f"iter.{str(iter_idx).zfill(6)}")
+        fp_dir = iter_dir / "02.fp"
+        fp_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"[TMPL] Generating FP tasks in {fp_dir}")
+
+        fp_style = self.params.get("fp_style", "vasp")
+        prev_exp_dir = iter_dir / "01.model_devi"
+        sys_idx_list = self.params.get("sys_configs", [])
+        task_idx = 0
+
+        # --- select candidate frames from model_devi trajectories ---
+        for sys_idx in range(len(sys_idx_list)):
+            traj_files = sorted(glob(str(prev_exp_dir / f"task.{sys_idx}.*/traj/*.lammpstrj")))
+            candidate_out = []
+            accurate_out = []
+            failed_out = []
+
+            for traj_file in traj_files:
+                task_name = Path(traj_file).parent.parent.name
+                try:
+                    frames = dpdata.System(traj_file, fmt="lammps/dump")
+                    # Select middle frames (skip initial equilibration)
+                    start = max(0, len(frames) // 10)
+                    for frame_idx in range(start, len(frames), max(1, len(frames) // 20)):
+                        task_fp_dir = fp_dir / f"task.{sys_idx}.{task_idx}"
+                        task_fp_dir.mkdir(parents=True, exist_ok=True)
+
+                        # Write POSCAR
+                        frame = frames[frame_idx]
+                        frame.to_vasp_poscar(str(task_fp_dir / "POSCAR"))
+
+                        # For CP2K: write coord.xyz
+                        if fp_style == "cp2k":
+                            frame.to_cp2k_xyz(str(task_fp_dir / "coord.xyz"))
+
+                        candidate_out.append(f"{task_name} {frame_idx}")
+                        task_idx += 1
+                except Exception as e:
+                    logger.warning(f"Failed to process {traj_file}: {e}")
+
+            # Write shuffled output files
+            if candidate_out:
+                with open(fp_dir / f"candidate.shuffled.{str(sys_idx).zfill(3)}.out", "w") as f:
+                    f.write("\n".join(candidate_out) + "\n")
+
+        # --- generate input files per FP style ---
+        if fp_style == "vasp":
+            self._make_fp_vasp_inputs(fp_dir, iter_idx)
+        elif fp_style == "cp2k":
+            self._make_fp_cp2k_inputs(fp_dir)
+
+        logger.info(f"[TMPL] Generated {task_idx} FP tasks in {fp_dir}")
+        return 0
+
+    def _make_fp_vasp_inputs(self, fp_dir: Path, iter_idx: int):
+        """Generate VASP INCAR/POTCAR for FP tasks."""
+        fp_params = self.params.get("fp_params", {})
+        user_fp_params = self.params.get("user_fp_params", {})
+        fp_incar = fp_params.get("fp_incar", {}) or user_fp_params
+
+        task_dirs = sorted(glob(str(fp_dir / "task.*")))
+        for task_dir in task_dirs:
+            td = Path(task_dir)
+            # INCAR: write from fp_params
+            if fp_incar:
+                shutil.copy(fp_incar, td / "INCAR")
+            # POTCAR: link from potential directory
+            potcar_dir = fp_params.get("potcar_prefix", ".")
+            potcar_map = fp_params.get("potcar_map", {})
+            # Generate POTCAR for each element
+            potcar_path = td / "POTCAR"
+            if not potcar_path.exists():
+                try:
+                    from ase.io import read as ase_read
+                    atoms = ase_read(td / "POSCAR")
+                    symbols = set(atoms.get_chemical_symbols())
+                    with open(potcar_path, "w") as potcar_out:
+                        for sym in symbols:
+                            potcar_file = Path(potcar_dir) / potcar_map.get(sym, f"POTCAR.{sym}")
+                            if potcar_file.exists():
+                                potcar_out.write(potcar_file.read_text())
+                except Exception:
+                    pass
+            # KPOINTS
+            kspacing = fp_params.get("kspacing", 0.2)
+            with open(td / "KPOINTS", "w") as f:
+                f.write(f"KSPACING = {kspacing}\n")
+
+    def _make_fp_cp2k_inputs(self, fp_dir: Path):
+        """Generate CP2K input files for FP tasks using templates."""
+        tpl_path = find_template("cp2k/fp.inp")
+        if tpl_path is None:
+            logger.warning("CP2K template not found, using default input generation")
+            return
+
+        fp_params = self.params.get("fp_params", {})
+
+        task_dirs = sorted(glob(str(fp_dir / "task.*")))
+        for task_dir in task_dirs:
+            td = Path(task_dir)
+            render_template(tpl_path, {
+                "PROJECT": "cp2k_fp",
+                "BASIS_FILE": fp_params.get("basis_file", "BASIS_MOLOPT"),
+                "POTENTIAL_FILE": fp_params.get("potential_file", "POTENTIAL"),
+                "CUTOFF": str(fp_params.get("cutoff", 400)),
+                "XC_FUNCTIONAL": fp_params.get("xc_functional", "PBE"),
+                "CELL_PARAMS": "",
+                "COORD_FILE": "",
+                "COORD_FORMAT": "XYZ",
+                "COORD_FILE_NAME": "coord.xyz",
+            }, str(td / "input.inp"))
 
     def run(self):
         """Run FP labeling via oh-my-batch (omb) if available, fallback to dpgen."""
@@ -266,6 +586,9 @@ class FPCalculation(TeslaWorkStep):
             raise RuntimeError(f"OMB labeling failed: {result.stderr}")
 
     def post(self):
+        if self._use_template():
+            from catflow.tasker.collectors.labeling import collect_labeling_results
+            return collect_labeling_results(self.step_code)
         from dpgen.generator.run import post_fp
         return post_fp(self.step_code, self.params)
 

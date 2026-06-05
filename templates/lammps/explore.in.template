@@ -1,0 +1,33 @@
+variable          NSTEPS          equal @NSTEPS
+variable          THERMO_FREQ     equal 100
+variable          DUMP_FREQ       equal 100
+variable          TEMP            equal @TEMP
+variable          PRES            equal 1
+variable          TAU_T           equal 0.1
+variable          TAU_P           equal 0.5
+
+units           metal
+boundary        p p p
+atom_style      atomic
+
+neighbor        1.0 bin
+box             tilt large
+
+read_data       conf.lmp
+change_box      all triclinic
+
+mass            * @MASS_MAP
+
+pair_style      deepmd @DP_MODELS out_freq ${THERMO_FREQ} out_file model_devi.out
+pair_coeff      * *
+
+velocity        all create ${TEMP} @SEED
+
+fix             1 all nvt temp ${TEMP} ${TEMP} ${TAU_T}
+
+thermo_style    custom step temp pe ke etotal press vol
+thermo          ${THERMO_FREQ}
+dump            1 all custom ${DUMP_FREQ} traj/*.lammpstrj id type x y z fx fy fz
+
+timestep        @DT
+run             ${NSTEPS} upto

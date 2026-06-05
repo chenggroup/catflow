@@ -1,0 +1,54 @@
+{
+    "model": {
+        "type_map": [@TYPE_MAP],
+        "descriptor": {
+            "type": "se_a",
+            "rcut": 6.0,
+            "rcut_smth": 0.5,
+            "sel": [@SEL],
+            "neuron": [25, 50, 100],
+            "axis_neuron": 16,
+            "seed": @SEED,
+            "_comment": "from default_training_param"
+        },
+        "fitting_net": {
+            "neuron": [240, 240, 240],
+            "resnet_dt": true,
+            "seed": @SEED,
+            "_comment": "from default_training_param"
+        }
+    },
+    "learning_rate": {
+        "type": "exp",
+        "start_lr": 0.001,
+        "decay_rate": 0.95,
+        "decay_steps": @DECAY_STEPS,
+        "_comment": "from default_training_param"
+    },
+    "loss": {
+        "start_pref_e": 0.02,
+        "limit_pref_e": 2,
+        "start_pref_f": 1000,
+        "limit_pref_f": 1,
+        "start_pref_v": 0.0,
+        "limit_pref_v": 0.0
+    },
+    "training": {
+        "training_data": {
+            "systems": [@DP_DATASET],
+            "batch_size": "auto",
+            "prob_sys_size": "prob_sys_size"
+        },
+        "numb_steps": @STEPS,
+        "seed": @SEED,
+        "disp_file": "lcurve.out",
+        "disp_freq": 1000,
+        "save_freq": 10000,
+        "save_ckpt": "model.ckpt",
+        "disp_training": true,
+        "time_training": true,
+        "tensorboard": false,
+        "profiling": false,
+        "_comment": "from default_training_param"
+    }
+}
