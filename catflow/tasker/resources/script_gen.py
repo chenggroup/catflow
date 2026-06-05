@@ -176,21 +176,25 @@ class TeslaBatchScript(ScriptBuilder):
 
     def train_stage(self, work_dir: str, model_count: int = 4,
                     train_steps: int = 400000, concurrency: int = 4):
-        """Generate training stage script (DeepMD)."""
+        """Generate training stage script (DeepMD).
+
+        Assumes model directories (000/, 001/, ...) with input.json
+        have already been created by Python _make_template or dpgen.
+        This generates run.sh, packs into batch scripts, and submits.
+        """
         self.add_comment("=== Training Stage ===")
         self.add_body(f"TRAIN_DIR={work_dir}/00.train")
-        self.add_body("mkdir -p $TRAIN_DIR")
         self.add_empty()
 
-        # Generate training tasks with random seeds
-        self.add_comment("Generate training tasks")
+        # Create run.sh in each model directory (seed substitution via combo)
+        self.add_comment("Generate run.sh for each model")
         self.add_body(
             f"omb combo \\\n"
             f"  add_randint SEED -n {model_count} -a 0 -b 999999 \\\n"
-            f"  make_files $TRAIN_DIR/model-{{i}}/input.json "
-            f"--template {work_dir}/templates/deepmd/input.json \\\n"
-            f"  make_files $TRAIN_DIR/model-{{i}}/run.sh "
-            f"--template {work_dir}/templates/deepmd/run.sh --mode 755 \\\n"
+            f"  add_var STEPS {train_steps} \\\n"
+            f"  set_broadcast STEPS \\\n"
+            f"  make_files $TRAIN_DIR/{{i}}/run.sh "
+            f"--template templates/deepmd/run.sh --mode 755 \\\n"
             f"  done"
         )
         self.add_empty()
@@ -199,13 +203,13 @@ class TeslaBatchScript(ScriptBuilder):
         self.add_comment("Pack training tasks")
         self.add_body(
             f"omb batch \\\n"
-            f"  add_work_dirs $TRAIN_DIR/model-* \\\n"
+            f"  add_work_dirs $TRAIN_DIR/000 $TRAIN_DIR/001 $TRAIN_DIR/002 $TRAIN_DIR/003 \\\n"
             f"  add_cmd 'bash run.sh' \\\n"
             f"  make $TRAIN_DIR/train-{{i}}.slurm --concurrency {concurrency}"
         )
         self.add_empty()
 
-        # Submit
+        # Submit with recovery
         self.add_comment("Submit training jobs")
         self.add_body(
             f"omb job slurm submit $TRAIN_DIR/train-*.slurm \\\n"
@@ -213,29 +217,27 @@ class TeslaBatchScript(ScriptBuilder):
         )
 
     def explore_stage(self, work_dir: str, iter_name: str,
-                      temperatures: list, model_count: int = 4,
                       concurrency: int = 5):
-        """Generate exploration stage script (LAMMPS)."""
+        """Generate exploration stage script (LAMMPS).
+
+        Assumes task.* directories with input.lammps and conf.lmp
+        have already been created by Python _make_template or dpgen.
+        This generates run.sh, packs into batch scripts, and submits.
+        """
         self.add_comment("=== Exploration Stage ===")
         iter_dir = f"{work_dir}/iter-{iter_name}"
-        exp_dir = f"{iter_dir}/01.explore"
+        exp_dir = f"{iter_dir}/01.model_devi"
         self.add_body(f"EXPLORE_DIR={exp_dir}")
-        self.add_body("mkdir -p $EXPLORE_DIR")
         self.add_empty()
 
-        # Generate exploration tasks
-        temps_str = " ".join(str(t) for t in temperatures)
-        self.add_comment("Generate exploration tasks with omb combo")
+        # Create run.sh in each task directory
+        self.add_comment("Create run.sh in each exploration task")
         self.add_body(
-            f"omb combo \\\n"
-            f"  add_var TEMP {temps_str} \\\n"
-            f"  add_seq MODEL --start 0 --stop {model_count} --step 1 \\\n"
-            f"  add_files CONF {iter_dir}/00.train/model-*/graph.pb \\\n"
-            f"  make_files $EXPLORE_DIR/job-{{i}}/in.lammps "
-            f"--template {work_dir}/templates/lammps/explore.in \\\n"
-            f"  make_files $EXPLORE_DIR/job-{{i}}/run.sh "
-            f"--template {work_dir}/templates/lammps/run.sh --mode 755 \\\n"
-            f"  done"
+            f"for task_dir in $EXPLORE_DIR/task.*; do\n"
+            f"  cp templates/lammps/run.sh $task_dir/run.sh\n"
+            f"  chmod 755 $task_dir/run.sh\n"
+            f"  echo '[OMB] Created run.sh in $task_dir'\n"
+            f"done"
         )
         self.add_empty()
 
@@ -243,7 +245,7 @@ class TeslaBatchScript(ScriptBuilder):
         self.add_comment("Pack exploration tasks")
         self.add_body(
             f"omb batch \\\n"
-            f"  add_work_dirs $EXPLORE_DIR/job-* \\\n"
+            f"  add_work_dirs $EXPLORE_DIR/task.* \\\n"
             f"  add_cmd 'bash run.sh' \\\n"
             f"  make $EXPLORE_DIR/explore-{{i}}.slurm --concurrency {concurrency}"
         )
@@ -258,23 +260,28 @@ class TeslaBatchScript(ScriptBuilder):
 
     def labeling_stage(self, work_dir: str, iter_name: str,
                        software: str = "cp2k", concurrency: int = 5):
-        """Generate labeling stage script (CP2K or VASP)."""
+        """Generate labeling stage script (CP2K or VASP).
+
+        Assumes task.* directories with POSCAR/coord.xyz and input files
+        have already been created by Python _make_template or dpgen.
+        """
         self.add_comment(f"=== Labeling Stage ({software}) ===")
         iter_dir = f"{work_dir}/iter-{iter_name}"
-        label_dir = f"{iter_dir}/02.label"
+        label_dir = f"{iter_dir}/02.fp"
         self.add_body(f"LABEL_DIR={label_dir}")
-        self.add_body("mkdir -p $LABEL_DIR")
         self.add_empty()
 
-        self.add_comment("Generate labeling tasks")
+        # Detect and use appropriate command
+        self.add_comment("Detect FP software")
         if software == "cp2k":
-            run_cmd = "cp2k.ssmp -i cp2k.inp"
+            run_cmd = "cp2k.ssmp -i input.inp"
         else:
             run_cmd = "mpirun vasp_std"
 
+        # Pack and submit
         self.add_body(
             f"omb batch \\\n"
-            f"  add_work_dirs $LABEL_DIR/job-* \\\n"
+            f"  add_work_dirs $LABEL_DIR/task.* \\\n"
             f"  add_cmd '{run_cmd}' \\\n"
             f"  make $LABEL_DIR/label-{{i}}.slurm --concurrency {concurrency}"
         )

@@ -1,0 +1,38 @@
+# LAMMPS exploration input
+# @TEMP@ substituted by omb combo
+
+variable          NSTEPS          equal 10000
+variable          THERMO_FREQ     equal 100
+variable          DUMP_FREQ       equal 100
+variable          TEMP            equal @TEMP@
+variable          TAU_T           equal 0.1
+
+units           metal
+boundary        p p p
+atom_style      atomic
+neighbor        1.0 bin
+box             tilt large
+
+read_data       ../confs/conf.lmp
+change_box      all triclinic
+
+mass            1 195.084  # Pt
+mass            2 15.999   # O
+
+pair_style      deepmd ../../00.train/000/graph.pb \
+                       ../../00.train/001/graph.pb \
+                       ../../00.train/002/graph.pb \
+                       ../../00.train/003/graph.pb \
+                       out_freq ${THERMO_FREQ} out_file model_devi.out
+pair_coeff      * *
+
+velocity        all create ${TEMP} 12345
+
+fix             1 all nvt temp ${TEMP} ${TEMP} ${TAU_T}
+
+thermo_style    custom step temp pe ke etotal press
+thermo          ${THERMO_FREQ}
+dump            1 all custom ${DUMP_FREQ} traj/*.lammpstrj id type x y z fx fy fz
+
+timestep        0.002
+run             ${NSTEPS} upto

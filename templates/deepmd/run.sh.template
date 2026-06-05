@@ -1,0 +1,28 @@
+#!/bin/bash
+set -e
+
+# DeePMD training execution
+# @SEED@, @STEPS@ substituted by omb combo
+# Standard DeePMD-kit training workflow
+
+cd "$(dirname "$0")"
+
+SEED="@SEED@"
+STEPS="@STEPS@"
+NP="${NP:-1}"
+
+# Check if MPI is requested
+if [ "$NP" -gt 1 ] && command -v mpirun &>/dev/null; then
+    mpirun -np "$NP" dp train input.json
+else
+    dp train input.json
+fi
+
+# Freeze the trained model
+dp freeze -o frozen_model.pb
+
+# Compress for LAMMPS interface (optional, silently skip if fails)
+dp compress -i frozen_model.pb -o graph.pb -t input.json 2>/dev/null || \
+    cp frozen_model.pb graph.pb
+
+echo "[DONE] DeePMD training finished in $PWD"

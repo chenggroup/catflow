@@ -377,16 +377,6 @@ class DPExploration(TeslaWorkStep):
                 self.step_code, self.params, self.machine
             )
 
-        # Extract temperatures from params
-        try:
-            model_devi_jobs = self.params.get("model_devi_jobs", [])
-            cur_job = model_devi_jobs[self.step_code] if self.step_code < len(model_devi_jobs) else model_devi_jobs[-1]
-            temps = cur_job.get("rev_mat", {}).get("lmp", {}).get("V_TEMP", [300, 500, 1000])
-        except Exception:
-            temps = [300, 500, 1000]
-
-        n_models = self.params.get("numb_models", 4)
-
         script = TeslaBatchScript(
             machine=MachineConfig(
                 name="tesla_explore",
@@ -402,8 +392,6 @@ class DPExploration(TeslaWorkStep):
         script.explore_stage(
             work_dir=str(work_dir),
             iter_name=str(self.step_code).zfill(6),
-            temperatures=temps,
-            model_count=n_models,
             concurrency=5,
         )
         script_path = script.write(str(explore_dir / "run_omb_explore.sh"))
