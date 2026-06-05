@@ -22,10 +22,19 @@ setup.sh → iter.sh
 ## Quick Start
 
 ```bash
+# 直接运行（使用 dummy 命令，无需真实软件）
 bash run.sh
 ```
 
-This runs a single iteration: Train → Explore → Screen → Label. All compute commands are dummies (no real DeePMD/LAMMPS/CP2K needed) — they generate expected output files to validate the workflow pipeline.
+或用 Docker 进行真实计算：
+
+```bash
+docker run --rm -v $(pwd):/workspace -w /workspace \
+  registry.linkease.net:5443/library/deepmodeling/deepmd-kit:latest \
+  bash -c "pip install oh-my-batch && bash run.sh"
+```
+
+Docker 镜像内自动使用真实的 `dp train` 和 `lmp` 命令，无需手动修改配置。CP2K 标注步骤保持 dummy（镜像内无 CP2K）。
 
 ## Expected Output
 
